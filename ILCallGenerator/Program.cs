@@ -3,8 +3,17 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
 using System.Runtime.InteropServices;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+using Mono.Cecil.Rocks;
+using Mono.Collections.Generic;
+using FieldAttributes = Mono.Cecil.FieldAttributes;
+using GenericParameterAttributes = Mono.Cecil.GenericParameterAttributes;
+using MethodAttributes = Mono.Cecil.MethodAttributes;
+using MethodImplAttributes = Mono.Cecil.MethodImplAttributes;
+using ParameterAttributes = Mono.Cecil.ParameterAttributes;
+using TypeAttributes = Mono.Cecil.TypeAttributes;
 
 namespace ConsoleApplication2
 {
@@ -19,17 +28,19 @@ namespace ConsoleApplication2
         public struct ModDefinition
         {
             public string name;
-            public object callingConvention;
+            public MethodCallingConvention callingConvention;
             public bool hasThis;
             public bool isUnity;
             public bool il2cpp;
-            public bool IsManaged => callingConvention is CallingConventions;
+            public bool IsManaged => callingConvention == MethodCallingConvention.Default;
         }
 
         private static Type[] funcPtrType = new Type[] { typeof(IntPtr) };
-        private static ModuleBuilder module;
-        private static AssemblyBuilder dynamicAssembly;
-        private static TypeBuilder refReturnType;
+        private static ModuleDefinition module;
+        private static AssemblyDefinition dynamicAssembly;
+        private static MethodReference invalidOperationExceptionConstructor;
+
+        //private static TypeBuilder refReturnType;
 
         private static Type[] returnTypes = new Type[]
         {
@@ -47,94 +58,101 @@ namespace ConsoleApplication2
             typeof(double),
         };
 
-        public static OpCode[] returnTypeOpcodes = new OpCode[]
-        {
-            OpCodes.Conv_U1,
-            OpCodes.Conv_U2,
-            OpCodes.Conv_I2,
-            OpCodes.Conv_U4,
-            OpCodes.Conv_I4,
-            OpCodes.Conv_I8,
-            OpCodes.Conv_U8,
-            OpCodes.Conv_U,
-            OpCodes.Conv_U,
-            OpCodes.Conv_I,
-            OpCodes.Conv_R4,
-            OpCodes.Conv_R8,
-        };
-        
         public static ModStruct AddModType(ModDefinition definition)
         {
-            var type = module.DefineType($"Func{definition.name}",
-                TypeAttributes.Public | TypeAttributes.SequentialLayout);
-            type.SetParent(typeof(ValueType));
+            var type = module.DefineType("", $"Func{definition.name}", TypeAttributes.Public | TypeAttributes.SequentialLayout);
+            type.BaseType = module.ImportReference(typeof(ValueType));
+            module.Types.Add(type);
 
-            FieldBuilder funcPtrField = null;
+            FieldDefinition funcPtrField = null;
             if (definition.isUnity && !definition.il2cpp)
                 funcPtrField = type.DefineField("methodPtr", typeof(ulong), FieldAttributes.Public);
             else
                 funcPtrField = type.DefineField("methodPtr", typeof(IntPtr), FieldAttributes.Public);
 
-            const int maxNumArgs = 4;
+            const int maxNumArgs = 8;
             for (int i = 0; i <= maxNumArgs; i++)
             {
-                var method = AddMethod(funcPtrField, definition, type, null, i);
-                AddReferenceStubMethod(definition, type, method, i);
-
-                for (int typeId = 0; typeId < returnTypes.Length; typeId++)
-                    AddTypeForward(returnTypes[typeId], definition, type, method, i);
+                for (int retType = 0; retType < 4; retType++)
+                {
+                    if (definition.hasThis)
+                    {
+                        AddMethod(true, false, funcPtrField, definition, type, retType, i);
+                        AddMethod(true, true, funcPtrField, definition, type, retType, i);
+                        //AddPointerStubMethod(definition, type, method, i);
+                        //AddReferenceStubMethod(definition, type, method, i);
+                    }
+                    else
+                    {
+                        AddMethod(false, false, funcPtrField, definition, type, retType, i);
+                        //AddPointerStubMethod(definition, type, method1, i);
+                        //AddReferenceStubMethod(definition, type, method1, i);
+                        //AddPointerStubMethod(definition, type, method2, i);
+                        //AddReferenceStubMethod(definition, type, method2, i);
+                    }
+                }
+               
+                
+                //for (int typeId = 0; typeId < returnTypes.Length; typeId++)
+                //    AddTypeForward(returnTypes[typeId], definition, type, method, i);
             }
 
             for (int i = 0; i <= maxNumArgs; i++)
             {
-                AddMethod(funcPtrField, definition, type, typeof(void), i);
+                if (definition.hasThis)
+                {
+                    AddMethod(true, false, funcPtrField, definition, type, 0, i);
+                    AddMethod(true, true, funcPtrField, definition, type, 0, i);
+                }
+                else
+                {
+                    AddMethod(false, false, funcPtrField, definition, type, 0, i);
+                }
             }
 
             if (!definition.isUnity || definition.il2cpp)
             {
                 var initMethod = type.DefineMethod("FromPointer", MethodAttributes.Public | MethodAttributes.Static);
-                initMethod.SetReturnType(type);
-                initMethod.SetParameters(typeof(IntPtr));
-                initMethod.SetImplementationFlags(initMethod.GetMethodImplementationFlags() |
-                                                  MethodImplAttributes.AggressiveInlining);
+                initMethod.ReturnType = type;
+                initMethod.Parameters.Add(new ParameterDefinition("ptr", ParameterAttributes.None, module.TypeSystem.IntPtr));
+                initMethod.ImplAttributes |= MethodImplAttributes.AggressiveInlining;
 
-                var il = initMethod.GetILGenerator();
+                var il = initMethod.Body.GetILProcessor();
                 il.DeclareLocal(type);
-                il.Emit(OpCodes.Ldloca_S, 0);
+                il.Emit(OpCodes.Ldloca_S, (byte)0);
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Stfld, funcPtrField);
-                il.Emit(OpCodes.Ldloc_S, 0);
+                il.Emit(OpCodes.Ldloc_S, (byte)0);
                 il.Emit(OpCodes.Ret);
 
                 var initMethod2 = type.DefineMethod("FromPointer", MethodAttributes.Public | MethodAttributes.Static);
-                initMethod2.SetReturnType(type);
-                initMethod2.SetParameters(typeof(void*));
-                initMethod2.SetImplementationFlags(initMethod2.GetMethodImplementationFlags() |
-                                                   MethodImplAttributes.AggressiveInlining);
+                initMethod2.ReturnType = type;
+                initMethod2.Parameters.Add(new ParameterDefinition("ptr", ParameterAttributes.None, new PointerType(module.TypeSystem.Void)));
+                initMethod2.ImplAttributes |= MethodImplAttributes.AggressiveInlining;
 
-                il = initMethod2.GetILGenerator();
+                il = initMethod2.Body.GetILProcessor();
                 il.DeclareLocal(type);
-                il.Emit(OpCodes.Ldloca_S, 0);
+                il.Emit(OpCodes.Ldloca_S, (byte)0);
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Stfld, funcPtrField);
-                il.Emit(OpCodes.Ldloc_S, 0);
+                il.Emit(OpCodes.Ldloc_S, (byte)0);
                 il.Emit(OpCodes.Ret);
             }
             else if (definition.isUnity && !definition.il2cpp)
             {
                 var initMethod = type.DefineMethod("FromPointer", MethodAttributes.Public | MethodAttributes.Static);
-                initMethod.SetReturnType(type);
+                initMethod.ReturnType = type;
+                initMethod.Parameters.Add(new ParameterDefinition("ptr", ParameterAttributes.None, module.TypeSystem.IntPtr));
+                initMethod.Parameters.Add(new ParameterDefinition("x", ParameterAttributes.None, module.TypeSystem.Boolean));
 
-                initMethod.SetParameters(typeof(IntPtr), typeof(bool));
                 initMethod.DefineParameter(1, ParameterAttributes.None, "funcPtr");
                 var p = initMethod.DefineParameter(2, ParameterAttributes.Optional | ParameterAttributes.HasDefault,
                     "isIL2CPPDirect");
-                p.SetConstant(false);
+                p.Constant = false;
 
-                initMethod.SetImplementationFlags(initMethod.GetMethodImplementationFlags() |
-                                                  MethodImplAttributes.AggressiveInlining);
-
-                var il = initMethod.GetILGenerator();
+                initMethod.ImplAttributes |= MethodImplAttributes.AggressiveInlining;
+                
+                var il = initMethod.Body.GetILProcessor();
                 il.DeclareLocal(typeof(ulong));
                 var label = il.DefineLabel();
                 var skip4byteTransform = il.DefineLabel();
@@ -144,7 +162,7 @@ namespace ConsoleApplication2
                 il.Emit(OpCodes.Conv_U8);
                 il.Emit(OpCodes.Stloc_0);
 
-                il.Emit(OpCodes.Sizeof, typeof(void*));
+                il.Emit(OpCodes.Sizeof, module.TypeSystem.Void.MakePointerType());
                 il.Emit(OpCodes.Ldc_I4_4);
                 il.Emit(OpCodes.Bne_Un_S, skip4byteTransform);
 
@@ -159,21 +177,21 @@ namespace ConsoleApplication2
                 il.Emit(OpCodes.Ldarg_1);
                 il.Emit(OpCodes.Brtrue_S, label);
 
-                il.Emit(OpCodes.Ldloca_S, 1);
+                il.Emit(OpCodes.Ldloca_S, (byte)1);
                 il.Emit(OpCodes.Ldloc_0);
                 il.Emit(OpCodes.Stfld, funcPtrField);
-                il.Emit(OpCodes.Ldloc_S, 1);
+                il.Emit(OpCodes.Ldloc_S, (byte)1);
                 il.Emit(OpCodes.Ret);
 
                 il.MarkLabel(label);
 
-                il.Emit(OpCodes.Ldloca_S, 1);
+                il.Emit(OpCodes.Ldloca_S, (byte)1);
                 il.Emit(OpCodes.Ldloc_0);
                 il.Emit(OpCodes.Ldc_I8, -9223372036854775808L);
                 //il.Emit(OpCodes.Conv_U8);
                 il.Emit(OpCodes.Or);
                 il.Emit(OpCodes.Stfld, funcPtrField);
-                il.Emit(OpCodes.Ldloc_S, 1);
+                il.Emit(OpCodes.Ldloc_S, (byte)1);
                 il.Emit(OpCodes.Ret);
             }
 
@@ -186,139 +204,25 @@ namespace ConsoleApplication2
             };
         }
 
-        private static void AddTypeForward(Type returnType, ModDefinition definition, TypeBuilder type,
-            MethodBuilder method,
-            int numArgs)
-        {
-            var strName = GetMethodNameForType(returnType);
-            var newMethod = type.DefineMethod(strName, MethodAttributes.Public);
-            
-            List<string> paramNames = new List<string>();
-
-            //paramNames.Add("TReturn");
-
-            if (definition.hasThis)
-                paramNames.Add("TThis");
-
-            for (int arg = 0; arg < numArgs; arg++)
-                paramNames.Add($"T{arg + 1}");
-
-            var genericParameters = new GenericTypeParameterBuilder[0];
-
-            if (paramNames.Count > 0)
-                genericParameters = newMethod.DefineGenericParameters(paramNames.ToArray());
-
-            var myArgs = genericParameters.Cast<Type>();
-            if (definition.isUnity)
-                myArgs = myArgs.Append(typeof(void*));
-
-            newMethod.SetParameters(myArgs.ToArray());
-            newMethod.SetReturnType(returnType);
-
-            if (definition.isUnity)
-            {
-                var p = newMethod.DefineParameter(myArgs.Count(),
-                    ParameterAttributes.Optional | ParameterAttributes.HasDefault,
-                    "runtimeMethodHandle");
-
-                p.SetConstant(null);
-            }
-
-            var callArgs = (new Type[] { returnType }).Concat(genericParameters.Select(x => (Type)x));
-            if (definition.isUnity)
-                callArgs = callArgs.Append(typeof(void*));
-
-            var il = newMethod.GetILGenerator();
-
-            il.Emit(OpCodes.Ldarg_0);
-
-            var na = paramNames.Count;
-            if (definition.isUnity)
-                na++;
-
-            for (int i = 0; i < na; i++)
-                il.Emit(OpCodes.Ldarg_S, i + 1);
-
-            il.Emit(OpCodes.Call, method.MakeGenericMethod(callArgs.ToArray()));
-            //il.Emit(OpCodes.Conv_U);
-            il.Emit(OpCodes.Ret);
-        }
-
-        private static void AddReferenceStubMethod(ModDefinition definition, TypeBuilder type, MethodBuilder method,
-            int numArgs)
-        {
-            var newMethod = type.DefineMethod($"Ref", MethodAttributes.Public);
-            
-            List<string> paramNames = new List<string>();
-
-            paramNames.Add("TReturn");
-
-            if (definition.hasThis)
-                paramNames.Add("TThis");
-
-            for (int arg = 0; arg < numArgs; arg++)
-                paramNames.Add($"T{arg + 1}");
-
-            var genericParameters = new GenericTypeParameterBuilder[0];
-
-            if (paramNames.Count > 0)
-                genericParameters = newMethod.DefineGenericParameters(paramNames.ToArray());
-
-            genericParameters[0].SetGenericParameterAttributes(
-                genericParameters[0].GenericParameterAttributes
-                | GenericParameterAttributes.NotNullableValueTypeConstraint
-            );
-
-            var myArgs = genericParameters.Skip(1).Cast<Type>();
-            if (definition.isUnity)
-                myArgs = myArgs.Append(typeof(void*));
-
-            newMethod.SetParameters(myArgs.ToArray());
-            newMethod.SetReturnType(genericParameters[0].MakeByRefType());
-
-            if (definition.isUnity)
-            {
-                var p = newMethod.DefineParameter(myArgs.Count(),
-                    ParameterAttributes.Optional | ParameterAttributes.HasDefault,
-                    "runtimeMethodHandle");
-
-                p.SetConstant(null);
-            }
-
-            var callArgs = (new Type[] { typeof(IntPtr) }).Concat(genericParameters.Skip(1).Select(x => (Type)x));
-            if (definition.isUnity)
-                callArgs = callArgs.Append(typeof(void*));
-
-            var il = newMethod.GetILGenerator();
-
-            il.Emit(OpCodes.Ldarg_0);
-
-            var na = paramNames.Count - 1;
-            if (definition.isUnity)
-                na++;
-
-            for (int i = 0; i < na; i++)
-                il.Emit(OpCodes.Ldarg_S, i + 1);
-
-            il.Emit(OpCodes.Call, method.MakeGenericMethod(callArgs.ToArray()));
-            //il.Emit(OpCodes.Conv_U);
-            il.Emit(OpCodes.Ret);
-        }
-
-        private static unsafe MethodBuilder AddMethod(FieldBuilder field, ModDefinition definition, TypeBuilder type,
-            Type returnType, int numArgs)
+        private static unsafe MethodDefinition AddMethod(bool hasThis, bool thisByRef, FieldDefinition field, ModDefinition definition, TypeDefinition type,
+            int returnType, int numArgs)
         {
             string methodName = null;
-            bool hasReturn = returnType != typeof(void);
-            bool hasGenericReturn = hasReturn && returnType == null;
+            bool hasReturn = returnType != 0;
+            bool hasGenericReturn = hasReturn && returnType >= 1;
 
-            if (returnType == null)
-                methodName = "Generic";
-            else if (returnType == typeof(void))
-                methodName = "Void";
-            else
-                methodName = GetMethodNameForType(returnType); // + "Call";
-
+            switch (returnType)
+            {
+                case 0:
+                    methodName = "Void"; break;
+                case 1:
+                    methodName = "Generic"; break;
+                case 2:
+                    methodName = "Ref"; break;
+                case 3:
+                    methodName = "Ptr"; break;
+            }
+            
             var callMethod = type.DefineMethod(methodName, MethodAttributes.Public);
 
             List<string> paramNames = new List<string>();
@@ -328,51 +232,69 @@ namespace ConsoleApplication2
 
             var argsStart = paramNames.Count;
 
-            if (definition.hasThis)
+            if (hasThis)
                 paramNames.Add("TThis");
 
             for (int arg = 0; arg < numArgs; arg++)
                 paramNames.Add($"T{arg + 1}");
 
-            var genericParameters = new GenericTypeParameterBuilder[0];
+            var genericParameters = new Collection<GenericParameter>();
 
             if (paramNames.Count > 0)
                 genericParameters = callMethod.DefineGenericParameters(paramNames.ToArray());
 
-            Type returnTypeOfCall = typeof(void);
-            Type returnTypeOfFunc = typeof(void);
+            TypeReference returnTypeOfCall = field.Module.TypeSystem.Void;
+            TypeReference returnTypeOfFunc = field.Module.TypeSystem.Void;
 
             if (hasReturn)
             {
-                if (hasGenericReturn)
+                if (returnType == 1)
                 {
                     returnTypeOfCall = genericParameters[0];
                     returnTypeOfFunc = genericParameters[0];
                 }
-                else
+                else if (returnType == 2)
                 {
-                    returnTypeOfCall = returnType;
-                    returnTypeOfFunc = returnType;
+                    genericParameters[0].Attributes |= GenericParameterAttributes.NotNullableValueTypeConstraint
+                                                       | GenericParameterAttributes.AllowByRefLikeConstraint;
+                    genericParameters[0].Constraints.Add(new GenericParameterConstraint(module.ImportReference(typeof(ValueType))));
+
+                    returnTypeOfCall = genericParameters[0].MakeByRefType();
+                    returnTypeOfFunc = genericParameters[0].MakeByRefType();
+                }
+                else if (returnType == 3)
+                {
+                    genericParameters[0].Attributes |= GenericParameterAttributes.NotNullableValueTypeConstraint 
+                                                       | GenericParameterAttributes.AllowByRefLikeConstraint;
+                    
+                    returnTypeOfCall = genericParameters[0].MakePointerType();
+                    returnTypeOfFunc = genericParameters[0].MakePointerType();
                 }
             }
 
-            var genParamTypes = genericParameters.Select(x => (Type)x).ToArray();
+            var genParamTypes = genericParameters.Select(x => (TypeReference)x).ToArray();
             if (hasGenericReturn)
                 genParamTypes[0] = returnTypeOfFunc;
 
-            var allArguments = genParamTypes.Length > 0 ? genParamTypes.Skip(argsStart).ToArray() : Type.EmptyTypes;
+            if (thisByRef)
+            {
+                int id = hasGenericReturn ? 1 : 0;
+                genParamTypes[id] = genParamTypes[id].MakeByRefType();
+                genericParameters[id].Constraints.Add(new GenericParameterConstraint(module.ImportReference(typeof(ValueType))));
+            }
+            
+            var allArguments = genParamTypes.Length > 0 ? genParamTypes.Skip(argsStart).ToArray() : Array.Empty<TypeReference>();
             if (definition.isUnity)
-                allArguments = allArguments.Append(typeof(void*)).ToArray();
+                allArguments = allArguments.Append(module.ImportReference(typeof(void*))).ToArray();
 
-            callMethod.SetReturnType(returnTypeOfFunc);
-            callMethod.SetParameters(allArguments);
-            callMethod.SetImplementationFlags(callMethod.GetMethodImplementationFlags() |
-                                              MethodImplAttributes.AggressiveInlining);
-
+            callMethod.ReturnType = returnTypeOfFunc;
+            callMethod.Parameters.Set(allArguments.Select(ConvertParameter));
+            callMethod.ImplAttributes |= MethodImplAttributes.AggressiveInlining;
+            
             for (int i = 0; i < allArguments.Length; i++)
             {
-                var id = i + 1 - (definition.hasThis ? 1 : 0);
-                if (i == 0 && definition.hasThis)
+                var id = i + 1 - (hasThis ? 1 : 0);
+                if (i == 0 && hasThis)
                 {
                     callMethod.DefineParameter(1, ParameterAttributes.None, "_this");
                 }
@@ -383,7 +305,7 @@ namespace ConsoleApplication2
                         var p = callMethod.DefineParameter(i + 1,
                             ParameterAttributes.None | ParameterAttributes.Optional | ParameterAttributes.HasDefault,
                             "runtimeHandleIL2CPP");
-                        p.SetConstant(null);
+                        p.Constant = null;
                     }
                     else
                     {
@@ -392,8 +314,7 @@ namespace ConsoleApplication2
                 }
             }
 
-            var generator = callMethod.GetILGenerator();
-
+            var generator = callMethod.Body.GetILProcessor();
             if (definition.isUnity && !definition.il2cpp)
             {
                 generator.DeclareLocal(typeof(ulong));
@@ -426,7 +347,7 @@ namespace ConsoleApplication2
                     else if (argId == 2)
                         generator.Emit(OpCodes.Ldarg_3);
                     else
-                        generator.Emit(OpCodes.Ldarg_S, (ushort)(argId + 1));
+                        generator.Emit(OpCodes.Ldarg_S, (byte)(argId + 1));
                 }
 
                 var managedArgs = allArguments.Take(allArguments.Length - 1).ToArray();
@@ -435,7 +356,11 @@ namespace ConsoleApplication2
                 generator.Emit(OpCodes.Ldfld, field);
                 generator.Emit(OpCodes.Conv_U);
 
-                generator.EmitCalli(OpCodes.Calli, CallingConventions.Standard, returnTypeOfFunc, managedArgs, null);
+                var callSite = new CallSite(returnTypeOfFunc);
+                callSite.CallingConvention = MethodCallingConvention.Default;
+                callSite.Parameters.Set(managedArgs.Select(ConvertParameter));
+                generator.Emit(OpCodes.Calli, callSite);
+                //generator.EmitCalli(OpCodes.Calli, CallingConventions.Standard, returnTypeOfFunc, managedArgs, null);
                 generator.Emit(OpCodes.Ret);
 
                 generator.MarkLabel(label1);
@@ -450,7 +375,7 @@ namespace ConsoleApplication2
                     else if (argId == 2)
                         generator.Emit(OpCodes.Ldarg_3);
                     else
-                        generator.Emit(OpCodes.Ldarg_S, (ushort)(argId + 1));
+                        generator.Emit(OpCodes.Ldarg_S, (byte)(argId + 1));
                 }
 
                 generator.Emit(OpCodes.Ldarg_0);
@@ -460,7 +385,10 @@ namespace ConsoleApplication2
                 generator.Emit(OpCodes.And);
                 generator.Emit(OpCodes.Conv_U);
 
-                generator.EmitCalli(OpCodes.Calli, CallingConvention.Cdecl, returnTypeOfCall, allArguments);
+                var callSite2 = new CallSite(returnTypeOfCall);
+                callSite2.CallingConvention = MethodCallingConvention.C;
+                callSite2.Parameters.Set(allArguments.Select(ConvertParameter));
+                generator.Emit(OpCodes.Calli, callSite2);
                 generator.Emit(OpCodes.Ret);
             }
             else if (definition.isUnity && definition.il2cpp)
@@ -475,13 +403,16 @@ namespace ConsoleApplication2
                     else if (argId == 2)
                         generator.Emit(OpCodes.Ldarg_3);
                     else
-                        generator.Emit(OpCodes.Ldarg_S, (ushort)(argId + 1));
+                        generator.Emit(OpCodes.Ldarg_S, (byte)(argId + 1));
                 }
 
                 generator.Emit(OpCodes.Ldarg_0);
                 generator.Emit(OpCodes.Ldfld, field);
 
-                generator.EmitCalli(OpCodes.Calli, CallingConvention.Cdecl, returnTypeOfCall, allArguments);
+                var callSite = new CallSite(returnTypeOfCall);
+                callSite.CallingConvention = MethodCallingConvention.C;
+                callSite.Parameters.Set(allArguments.Select(ConvertParameter));
+                generator.Emit(OpCodes.Calli, callSite);
                 generator.Emit(OpCodes.Ret);
             }
             else
@@ -496,7 +427,7 @@ namespace ConsoleApplication2
                     else if (argId == 2)
                         generator.Emit(OpCodes.Ldarg_3);
                     else
-                        generator.Emit(OpCodes.Ldarg_S, (ushort)(argId + 1));
+                        generator.Emit(OpCodes.Ldarg_S, (byte)(argId + 1));
                 }
 
                 generator.Emit(OpCodes.Ldarg_0);
@@ -504,19 +435,31 @@ namespace ConsoleApplication2
 
                 if (definition.IsManaged)
                 {
-                    var cconv = (CallingConventions)definition.callingConvention;
-                    generator.EmitCalli(OpCodes.Calli, cconv, returnTypeOfFunc, allArguments, null);
+                    var cconv = definition.callingConvention;
+                    var callSite = new CallSite(returnTypeOfFunc);
+                    callSite.CallingConvention = cconv;
+                    callSite.Parameters.Set(allArguments.Select(ConvertParameter));
+                    generator.Emit(OpCodes.Calli, callSite);
                 }
                 else
                 {
-                    var cconv = (CallingConvention)definition.callingConvention;
-                    generator.EmitCalli(OpCodes.Calli, cconv, returnTypeOfCall, allArguments);
+                    var cconv = definition.callingConvention;
+                    
+                    var callSite = new CallSite(returnTypeOfCall);
+                    callSite.CallingConvention = cconv;
+                    callSite.Parameters.Set(allArguments.Select(ConvertParameter));
+                    generator.Emit(OpCodes.Calli, callSite);
                 }
 
                 generator.Emit(OpCodes.Ret);
             }
 
             return callMethod;
+        }
+
+        private static ParameterDefinition ConvertParameter(TypeReference arg, int i)
+        {
+            return new ParameterDefinition($"_p{i}", ParameterAttributes.None, arg);
         }
 
         private static string GetMethodNameForType(Type returnType)
@@ -565,66 +508,72 @@ namespace ConsoleApplication2
 
         public class ModStruct
         {
-            public TypeBuilder type;
-            public FieldBuilder methodPtr;
+            public TypeReference type;
+            public FieldReference methodPtr;
             public ModDefinition definition;
         }
 
         public static void Main(string[] args)
         {
-            var an = new AssemblyName("ILCall");
-            dynamicAssembly = AppDomain.CurrentDomain.DefineDynamicAssembly(an, AssemblyBuilderAccess.RunAndSave);
-            module = dynamicAssembly.DefineDynamicModule("ILCall.dll", true);
-            an.Version = new Version(1, 0, 0);
+            var an = new AssemblyNameDefinition("ILCall", new Version(1,0,0));
+            dynamicAssembly = AssemblyDefinition.CreateAssembly(an, "ILCall.dll", new ModuleParameters()
+            {
+                Kind = ModuleKind.Dll
+            });
 
-            //GenerateRefReturnType();
-
+            module = dynamicAssembly.MainModule;
+            var invalidOpEx = module.ImportReference(typeof(InvalidOperationException)).Resolve();
+            invalidOperationExceptionConstructor = invalidOpEx.GetConstructors()
+                .First(x =>
+                    x.Parameters.Count == 1 && x.Parameters[0].ParameterType.TypeEquals(module.TypeSystem.String));
+            invalidOperationExceptionConstructor = module.ImportReference(invalidOperationExceptionConstructor);
+            
             var managed = AddModType(new ModDefinition()
             {
                 hasThis = true,
-                callingConvention = CallingConventions.Standard,
+                callingConvention = MethodCallingConvention.Default,
                 name = "Managed"
             });
 
             var managedStatic = AddModType(new ModDefinition()
             {
                 hasThis = false,
-                callingConvention = CallingConventions.Standard,
+                callingConvention = MethodCallingConvention.Default,
                 name = "Static"
             });
 
             var native = AddModType(new ModDefinition()
             {
                 hasThis = false,
-                callingConvention = CallingConvention.Winapi,
+                callingConvention = MethodCallingConvention.Unmanaged, // should be a special type
                 name = "Native"
             });
 
             var cdecl = AddModType(new ModDefinition()
             {
                 hasThis = false,
-                callingConvention = CallingConvention.Cdecl,
+                callingConvention = MethodCallingConvention.C,
                 name = "Cdecl"
             });
 
             var stdcall = AddModType(new ModDefinition()
             {
                 hasThis = false,
-                callingConvention = CallingConvention.StdCall,
+                callingConvention = MethodCallingConvention.StdCall,
                 name = "StdCall"
             });
 
             var thiscall = AddModType(new ModDefinition()
             {
                 hasThis = true,
-                callingConvention = CallingConvention.ThisCall,
+                callingConvention = MethodCallingConvention.ThisCall,
                 name = "ThisCall"
             });
 
             var unity = AddModType(new ModDefinition()
             {
                 hasThis = true,
-                callingConvention = CallingConvention.Cdecl,
+                callingConvention = MethodCallingConvention.C,
                 isUnity = true,
                 name = "Unity"
             });
@@ -632,7 +581,7 @@ namespace ConsoleApplication2
             var il2cpp = AddModType(new ModDefinition()
             {
                 hasThis = true,
-                callingConvention = CallingConvention.Cdecl,
+                callingConvention = MethodCallingConvention.C,
                 isUnity = true,
                 il2cpp = true,
                 name = "IL2CPP"
@@ -641,7 +590,7 @@ namespace ConsoleApplication2
             var il2cppStatic = AddModType(new ModDefinition()
             {
                 hasThis = false,
-                callingConvention = CallingConvention.Cdecl,
+                callingConvention = MethodCallingConvention.C,
                 isUnity = true,
                 il2cpp = true,
                 name = "IL2CPPStatic"
@@ -650,7 +599,7 @@ namespace ConsoleApplication2
             var unityStatic = AddModType(new ModDefinition()
             {
                 hasThis = false,
-                callingConvention = CallingConvention.Cdecl,
+                callingConvention = MethodCallingConvention.C,
                 isUnity = true,
                 name = "UnityStatic"
             });
@@ -691,33 +640,37 @@ namespace ConsoleApplication2
                     //TODO: Add type conversion.
                     var convMethod =
                         current.type.DefineMethod($"As{other.type.Name.Substring(4)}", MethodAttributes.Public);
-                    convMethod.SetReturnType(other.type);
-                    convMethod.InitLocals = false;
-
-                    var gen = convMethod.GetILGenerator();
+                    convMethod.ReturnType = other.type;
+                    convMethod.Body.InitLocals = false;
+                    
+                    var gen = convMethod.Body.GetILProcessor();
 
                     gen.DeclareLocal(other.type);
-                    gen.Emit(OpCodes.Ldloca_S, 0);
+                    gen.Emit(OpCodes.Ldloca_S, (byte)0);
                     gen.Emit(OpCodes.Ldarg_0);
                     gen.Emit(OpCodes.Ldfld, current.methodPtr);
                     gen.Emit(OpCodes.Stfld, other.methodPtr);
 
-                    gen.Emit(OpCodes.Ldloc_0, 0);
+                    gen.Emit(OpCodes.Ldloc_0);
                     gen.Emit(OpCodes.Ret);
                 }
             }
 
+            /*
             foreach (var typeBuilder in allTypes)
-                typeBuilder.type.CreateType();
+            {
+                module.Types.Add(typeBuilder.type.Resolve());
+            }
+            */
 
-            dynamicAssembly.Save("ILCall.dll");
+            dynamicAssembly.Write("ILCall.dll");
         }
 
         private static unsafe void GenerateToIL2CPP(ModStruct addToType, ModStruct toType)
         {
             var asil2cpp = addToType.type.DefineMethod("AsIL2CPP", MethodAttributes.Public);
-            asil2cpp.SetReturnType(toType.type);
-            var g = asil2cpp.GetILGenerator();
+            asil2cpp.ReturnType = toType.type;
+            var g = asil2cpp.Body.GetILProcessor();
             var m1 = g.DeclareLocal(typeof(ulong));
             var m2 = g.DeclareLocal(typeof(IntPtr));
             var newStruct = g.DeclareLocal(toType.type);
@@ -725,7 +678,7 @@ namespace ConsoleApplication2
 
             g.Emit(OpCodes.Ldc_I4_1);
             g.Emit(OpCodes.Conv_I8);
-            g.Emit(OpCodes.Ldc_I4_S, 63);
+            g.Emit(OpCodes.Ldc_I4_S, (sbyte)63);
             g.Emit(OpCodes.Shl);
             g.Emit(OpCodes.Conv_U8);
             g.Emit(OpCodes.Stloc_0);
@@ -735,7 +688,7 @@ namespace ConsoleApplication2
             g.Emit(OpCodes.And);
             g.Emit(OpCodes.Brtrue_S, label);
             g.Emit(OpCodes.Ldstr, "This is not IL2CPP direct call.");
-            g.Emit(OpCodes.Newobj, typeof(InvalidOperationException).GetConstructor(new Type[] { typeof(string) }));
+            g.Emit(OpCodes.Newobj, invalidOperationExceptionConstructor);
             g.Emit(OpCodes.Throw);
             g.MarkLabel(label);
             //g.Emit(OpCodes.Ldloca_S, newStruct);
@@ -760,8 +713,9 @@ namespace ConsoleApplication2
         private static unsafe void GenerateToManaged(ModStruct addToType, ModStruct toType)
         {
             var asil2cpp = addToType.type.DefineMethod("AsManaged", MethodAttributes.Public);
-            asil2cpp.SetReturnType(toType.type);
-            var g = asil2cpp.GetILGenerator();
+            asil2cpp.ReturnType = toType.type;
+            var g = asil2cpp.Body.GetILProcessor();
+            
             var m1 = g.DeclareLocal(typeof(ulong));
             var m2 = g.DeclareLocal(typeof(IntPtr));
             var newStruct = g.DeclareLocal(toType.type);
@@ -769,7 +723,7 @@ namespace ConsoleApplication2
 
             g.Emit(OpCodes.Ldc_I4_1);
             g.Emit(OpCodes.Conv_I8);
-            g.Emit(OpCodes.Ldc_I4_S, 63);
+            g.Emit(OpCodes.Ldc_I4_S, (sbyte)63);
             g.Emit(OpCodes.Shl);
             g.Emit(OpCodes.Conv_U8);
             g.Emit(OpCodes.Stloc_0);
@@ -779,7 +733,7 @@ namespace ConsoleApplication2
             g.Emit(OpCodes.And);
             g.Emit(OpCodes.Brfalse, label);
             g.Emit(OpCodes.Ldstr, "This is IL2CPP direct call.");
-            g.Emit(OpCodes.Newobj, typeof(InvalidOperationException).GetConstructor(new Type[] { typeof(string) }));
+            g.Emit(OpCodes.Newobj, invalidOperationExceptionConstructor);
             g.Emit(OpCodes.Throw);
             g.MarkLabel(label);
             //g.Emit(OpCodes.Ldloca_S, newStruct);
@@ -801,6 +755,7 @@ namespace ConsoleApplication2
             g.Emit(OpCodes.Ret);
         }
 
+        /*
         private static void GenerateRefReturnType()
         {
             refReturnType = module.DefineType("RefReturn", TypeAttributes.Public | TypeAttributes.SequentialLayout,
@@ -821,5 +776,6 @@ namespace ConsoleApplication2
         private static void GenerateFunctionWithReturnType(TypeBuilder type, Type retType, Type[] argTypes, int numArgs)
         {
         }
+        */
     }
 }
