@@ -36,9 +36,9 @@ For IL2CPP it's not possible to obtain function pointer with `MethodInfo.MethodH
 1. Returning reference-type values like string/object/arrays/class-objects etc working perfectly, you can even return their pointer from unmanaged land freely.
 2. Returning structs by `ref TStruct` works perfectly, even from native land.
 3. Struct-returning calls might have some issues, especially when structure is larger than IntPtr.Size.
+4. Under Mono 2x/.NET 3.5 under Unity it's not possible to use generic func (e.g. Generic/GenericRef/GenericPtr). Because for some reason it produces the crash. Instead use specialized (Byte,Int16,Int32, etc) versions. For 99.99% cases you can use IntPtr version and read it as a pointer to a struct.
 
 ## TODO:
-0. `ref TThis, ref T1, ref T2, etc` to have an ability to pass structures by reference. 
 1. Make automatic cross-runtime function pointer resolving (kinda easy, actually). I already have working code in another library.
 2. Make some function pointer wrappers and casting, so MethodInfo could be directly called via extension methods? Seems like a good solution.
 3. Make untyped return with byte[]/Span<> for special cases. Not sure yet would it be usable or not.
