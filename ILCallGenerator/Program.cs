@@ -35,78 +35,65 @@ namespace ConsoleApplication2
             public bool IsManaged => callingConvention == MethodCallingConvention.Default;
         }
 
-        private static Type[] funcPtrType = new Type[] { typeof(IntPtr) };
         private static ModuleDefinition module;
         private static AssemblyDefinition dynamicAssembly;
         private static MethodReference invalidOperationExceptionConstructor;
-
+        private static TypeReference ValueTypeImported;
+        private static TypeReference VoidPtrImported;
+        
+        private static bool net35 = true;
+        
         //private static TypeBuilder refReturnType;
 
-        private static Type[] returnTypes = new Type[]
+        public enum ReturnTypeEnum
         {
-            typeof(byte),
-            typeof(ushort),
-            typeof(short),
-            typeof(uint),
-            typeof(int),
-            typeof(long),
-            typeof(ulong),
-            typeof(string),
-            typeof(object),
-            typeof(IntPtr),
-            typeof(float),
-            typeof(double),
-        };
-
+            Void = 0,
+            Generic,
+            GenericRef,
+            GenericPtr,
+            Custom,
+        }
+        
         public static ModStruct AddModType(ModDefinition definition)
         {
             var type = module.DefineType("", $"Func{definition.name}", TypeAttributes.Public | TypeAttributes.SequentialLayout);
-            type.BaseType = module.ImportReference(typeof(ValueType));
+            type.BaseType = ValueTypeImported;
             module.Types.Add(type);
 
             FieldDefinition funcPtrField = null;
             if (definition.isUnity && !definition.il2cpp)
-                funcPtrField = type.DefineField("methodPtr", typeof(ulong), FieldAttributes.Public);
+                funcPtrField = type.DefineField("methodPtr", module.TypeSystem.UInt64, FieldAttributes.Public);
             else
-                funcPtrField = type.DefineField("methodPtr", typeof(IntPtr), FieldAttributes.Public);
+                funcPtrField = type.DefineField("methodPtr", module.TypeSystem.IntPtr, FieldAttributes.Public);
+
+            var retTypes = new List<ReturnTypeEnum>();
+            retTypes.Add(ReturnTypeEnum.Void);
+            retTypes.Add(ReturnTypeEnum.Generic);
+            retTypes.Add(ReturnTypeEnum.GenericPtr);
+            
+            if(!net35)
+                retTypes.Add(ReturnTypeEnum.GenericRef);
+            
+            retTypes.Add(ReturnTypeEnum.Custom);
 
             const int maxNumArgs = 8;
             for (int i = 0; i <= maxNumArgs; i++)
             {
-                for (int retType = 0; retType < 4; retType++)
+                string methodNameBase = "";
+
+                foreach (var retType in retTypes)
                 {
-                    if (definition.hasThis)
+                    if (retType == ReturnTypeEnum.Custom)
                     {
-                        AddMethod(true, false, funcPtrField, definition, type, retType, i);
-                        AddMethod(true, true, funcPtrField, definition, type, retType, i);
-                        //AddPointerStubMethod(definition, type, method, i);
-                        //AddReferenceStubMethod(definition, type, method, i);
+                        for (var index = 0; index < Names.ImportedTypes.Length; index++)
+                        {
+                            GenerateMethods(definition, retType, index, funcPtrField, type, i);
+                        }
                     }
                     else
                     {
-                        AddMethod(false, false, funcPtrField, definition, type, retType, i);
-                        //AddPointerStubMethod(definition, type, method1, i);
-                        //AddReferenceStubMethod(definition, type, method1, i);
-                        //AddPointerStubMethod(definition, type, method2, i);
-                        //AddReferenceStubMethod(definition, type, method2, i);
+                        GenerateMethods(definition, retType, 0, funcPtrField, type, i);
                     }
-                }
-               
-                
-                //for (int typeId = 0; typeId < returnTypes.Length; typeId++)
-                //    AddTypeForward(returnTypes[typeId], definition, type, method, i);
-            }
-
-            for (int i = 0; i <= maxNumArgs; i++)
-            {
-                if (definition.hasThis)
-                {
-                    AddMethod(true, false, funcPtrField, definition, type, 0, i);
-                    AddMethod(true, true, funcPtrField, definition, type, 0, i);
-                }
-                else
-                {
-                    AddMethod(false, false, funcPtrField, definition, type, 0, i);
                 }
             }
 
@@ -142,18 +129,14 @@ namespace ConsoleApplication2
             {
                 var initMethod = type.DefineMethod("FromPointer", MethodAttributes.Public | MethodAttributes.Static);
                 initMethod.ReturnType = type;
-                initMethod.Parameters.Add(new ParameterDefinition("ptr", ParameterAttributes.None, module.TypeSystem.IntPtr));
-                initMethod.Parameters.Add(new ParameterDefinition("x", ParameterAttributes.None, module.TypeSystem.Boolean));
-
-                initMethod.DefineParameter(1, ParameterAttributes.None, "funcPtr");
-                var p = initMethod.DefineParameter(2, ParameterAttributes.Optional | ParameterAttributes.HasDefault,
-                    "isIL2CPPDirect");
-                p.Constant = false;
-
+                
+                initMethod.Parameters.Add(new ParameterDefinition("funcPtr", ParameterAttributes.None, module.TypeSystem.IntPtr));
+                initMethod.Parameters.Add(new ParameterDefinition("isIL2CPPDirect", ParameterAttributes.Optional | ParameterAttributes.HasDefault, module.TypeSystem.Boolean));
+                initMethod.Parameters[initMethod.Parameters.Count - 1].Constant = false;
                 initMethod.ImplAttributes |= MethodImplAttributes.AggressiveInlining;
                 
                 var il = initMethod.Body.GetILProcessor();
-                il.DeclareLocal(typeof(ulong));
+                il.DeclareLocal(module.TypeSystem.UInt64);
                 var label = il.DefineLabel();
                 var skip4byteTransform = il.DefineLabel();
 
@@ -204,25 +187,49 @@ namespace ConsoleApplication2
             };
         }
 
-        private static unsafe MethodDefinition AddMethod(bool hasThis, bool thisByRef, FieldDefinition field, ModDefinition definition, TypeDefinition type,
-            int returnType, int numArgs)
+        private static void GenerateMethods(ModDefinition definition, ReturnTypeEnum retType, int customTypeId, FieldDefinition funcPtrField,
+            TypeDefinition type, int i)
         {
             string methodName = null;
-            bool hasReturn = returnType != 0;
-            bool hasGenericReturn = hasReturn && returnType >= 1;
-
-            switch (returnType)
-            {
-                case 0:
-                    methodName = "Void"; break;
-                case 1:
-                    methodName = "Generic"; break;
-                case 2:
-                    methodName = "Ref"; break;
-                case 3:
-                    methodName = "Ptr"; break;
-            }
+            methodName = GetMethodNameForReturn(retType, customTypeId);
+            var customType = retType == ReturnTypeEnum.Custom ? Names.ImportedTypes[customTypeId] : null;
             
+            if (definition.hasThis)
+            {
+                AddMethod("This" + methodName, true, false, funcPtrField, definition, type, retType, customType, i);
+                AddMethod("This" + methodName, true, true, funcPtrField, definition, type, retType, customType, i);
+                AddMethod(methodName, false, false, funcPtrField, definition, type, retType, customType, i);
+            }
+            else
+            {
+                AddMethod(methodName, false, false, funcPtrField, definition, type, retType, customType, i);
+            }
+        }
+
+        private static string GetMethodNameForReturn(ReturnTypeEnum retType, int customTypeId)
+        {
+            switch (retType)
+            {
+                case ReturnTypeEnum.Void:
+                    return "Void";
+                case ReturnTypeEnum.Generic:
+                    return "Generic";
+                case ReturnTypeEnum.GenericRef:
+                    return "Ref";
+                case ReturnTypeEnum.GenericPtr:
+                    return "Ptr";
+                case ReturnTypeEnum.Custom:
+                    return Names.TypeNames[customTypeId];
+                default:
+                    return "Invalid";
+            }
+        }
+
+        private static unsafe MethodDefinition AddMethod(string methodName, bool hasThis, bool thisByRef, FieldDefinition field, ModDefinition definition, TypeDefinition type,
+            ReturnTypeEnum returnType, TypeReference customReturnType, int numArgs)
+        {
+            bool hasReturn = returnType != 0;
+            bool hasGenericReturn = hasReturn && customReturnType == null;
             var callMethod = type.DefineMethod(methodName, MethodAttributes.Public);
 
             List<string> paramNames = new List<string>();
@@ -246,29 +253,40 @@ namespace ConsoleApplication2
             TypeReference returnTypeOfCall = field.Module.TypeSystem.Void;
             TypeReference returnTypeOfFunc = field.Module.TypeSystem.Void;
 
-            if (hasReturn)
+            if (hasGenericReturn)
             {
-                if (returnType == 1)
+                if (returnType == ReturnTypeEnum.Generic)
                 {
                     returnTypeOfCall = genericParameters[0];
                     returnTypeOfFunc = genericParameters[0];
                 }
-                else if (returnType == 2)
+                else if (returnType == ReturnTypeEnum.GenericRef)
                 {
                     genericParameters[0].Attributes |= GenericParameterAttributes.NotNullableValueTypeConstraint
                                                        | GenericParameterAttributes.AllowByRefLikeConstraint;
-                    genericParameters[0].Constraints.Add(new GenericParameterConstraint(module.ImportReference(typeof(ValueType))));
+                    genericParameters[0].Constraints.Add(new GenericParameterConstraint(ValueTypeImported));
 
                     returnTypeOfCall = genericParameters[0].MakeByRefType();
                     returnTypeOfFunc = genericParameters[0].MakeByRefType();
                 }
-                else if (returnType == 3)
+                else if (returnType == ReturnTypeEnum.GenericPtr)
                 {
                     genericParameters[0].Attributes |= GenericParameterAttributes.NotNullableValueTypeConstraint 
                                                        | GenericParameterAttributes.AllowByRefLikeConstraint;
                     
                     returnTypeOfCall = genericParameters[0].MakePointerType();
                     returnTypeOfFunc = genericParameters[0].MakePointerType();
+                }
+            }
+            else if(hasReturn)
+            {
+                returnTypeOfFunc = customReturnType;
+                returnTypeOfCall = customReturnType;
+                
+                if (customReturnType.IsPointer || !customReturnType.IsValueType)
+                {
+                    // demote to the pointer.
+                    returnTypeOfCall = module.TypeSystem.IntPtr;
                 }
             }
 
@@ -280,36 +298,40 @@ namespace ConsoleApplication2
             {
                 int id = hasGenericReturn ? 1 : 0;
                 genParamTypes[id] = genParamTypes[id].MakeByRefType();
-                genericParameters[id].Constraints.Add(new GenericParameterConstraint(module.ImportReference(typeof(ValueType))));
+                genericParameters[id].Constraints.Add(new GenericParameterConstraint(ValueTypeImported));
+                genericParameters[id].Attributes |= GenericParameterAttributes.NotNullableValueTypeConstraint 
+                                                   | GenericParameterAttributes.AllowByRefLikeConstraint;
             }
             
             var allArguments = genParamTypes.Length > 0 ? genParamTypes.Skip(argsStart).ToArray() : Array.Empty<TypeReference>();
             if (definition.isUnity)
-                allArguments = allArguments.Append(module.ImportReference(typeof(void*))).ToArray();
+                allArguments = allArguments.Append(VoidPtrImported).ToArray();
 
             callMethod.ReturnType = returnTypeOfFunc;
-            callMethod.Parameters.Set(allArguments.Select(ConvertParameter));
+            //callMethod.Parameters.Set(allArguments.Select(ConvertParameter));
             callMethod.ImplAttributes |= MethodImplAttributes.AggressiveInlining;
-            
+
             for (int i = 0; i < allArguments.Length; i++)
             {
                 var id = i + 1 - (hasThis ? 1 : 0);
                 if (i == 0 && hasThis)
                 {
-                    callMethod.DefineParameter(1, ParameterAttributes.None, "_this");
+                    callMethod.Parameters.Add(new ParameterDefinition("_this", ParameterAttributes.None, allArguments[0]));
+                    //callMethod.DefineParameter(1, ParameterAttributes.None, "_this");
                 }
                 else
                 {
                     if (i == allArguments.Length - 1 && definition.isUnity)
                     {
-                        var p = callMethod.DefineParameter(i + 1,
-                            ParameterAttributes.None | ParameterAttributes.Optional | ParameterAttributes.HasDefault,
-                            "runtimeHandleIL2CPP");
-                        p.Constant = null;
+                        var prm = new ParameterDefinition("runtimeHandleIL2CPP", ParameterAttributes.Optional | ParameterAttributes.HasDefault,
+                            VoidPtrImported);
+                        prm.Constant = null;
+                        callMethod.Parameters.Add(prm);
                     }
                     else
                     {
-                        callMethod.DefineParameter(i + 1, ParameterAttributes.None, $"arg{id}");
+                        callMethod.Parameters.Add(new ParameterDefinition($"arg{id}", ParameterAttributes.None, allArguments[i]));
+                        //callMethod.DefineParameter(i + 1, ParameterAttributes.None, $"arg{id}");
                     }
                 }
             }
@@ -317,7 +339,7 @@ namespace ConsoleApplication2
             var generator = callMethod.Body.GetILProcessor();
             if (definition.isUnity && !definition.il2cpp)
             {
-                generator.DeclareLocal(typeof(ulong));
+                generator.DeclareLocal(module.TypeSystem.UInt64);
             }
 
             // Load this and funcptr field
@@ -386,7 +408,7 @@ namespace ConsoleApplication2
                 generator.Emit(OpCodes.Conv_U);
 
                 var callSite2 = new CallSite(returnTypeOfCall);
-                callSite2.CallingConvention = MethodCallingConvention.C;
+                callSite2.CallingConvention = definition.callingConvention;
                 callSite2.Parameters.Set(allArguments.Select(ConvertParameter));
                 generator.Emit(OpCodes.Calli, callSite2);
                 generator.Emit(OpCodes.Ret);
@@ -410,7 +432,7 @@ namespace ConsoleApplication2
                 generator.Emit(OpCodes.Ldfld, field);
 
                 var callSite = new CallSite(returnTypeOfCall);
-                callSite.CallingConvention = MethodCallingConvention.C;
+                callSite.CallingConvention = definition.callingConvention;
                 callSite.Parameters.Set(allArguments.Select(ConvertParameter));
                 generator.Emit(OpCodes.Calli, callSite);
                 generator.Emit(OpCodes.Ret);
@@ -462,50 +484,6 @@ namespace ConsoleApplication2
             return new ParameterDefinition($"_p{i}", ParameterAttributes.None, arg);
         }
 
-        private static string GetMethodNameForType(Type returnType)
-        {
-            if (returnType == typeof(sbyte))
-                return "Char";
-
-            if (returnType == typeof(byte))
-                return "Byte";
-
-            if (returnType == typeof(short))
-                return "Int16";
-
-            if (returnType == typeof(ushort))
-                return "UInt16";
-
-            if (returnType == typeof(int))
-                return "Int32";
-
-            if (returnType == typeof(uint))
-                return "UInt32";
-
-            if (returnType == typeof(long))
-                return "Int64";
-
-            if (returnType == typeof(ulong))
-                return "UInt64";
-
-            if (returnType == typeof(IntPtr) || returnType == typeof(UIntPtr) || returnType.IsPointer)
-                return "IntPtr";
-
-            if (returnType == typeof(string))
-                return "String";
-
-            if (returnType == typeof(object))
-                return "Object";
-
-            if (returnType == typeof(float))
-                return "Float";
-            
-            if (returnType == typeof(double))
-                return "Double";
-
-            throw new KeyNotFoundException($"Can't find method name for type {returnType}");
-        }
-
         public class ModStruct
         {
             public TypeReference type;
@@ -513,33 +491,75 @@ namespace ConsoleApplication2
             public ModDefinition definition;
         }
 
+        private static DefaultAssemblyResolver Resolver;
+        static ModuleDefinition LoadNetstandard10()
+        {
+            var netstdRef = new AssemblyNameReference("mscorlib", new Version(2, 0, 0, 0));
+
+            var asm = Resolver.Resolve(netstdRef);   // this uses added search dirs
+            return asm.MainModule;
+        }
+        
         public static void Main(string[] args)
         {
+            
+            //var loadedAsssembly = AssemblyDefinition.ReadAssembly("C:\\Users\\alex\\Documents\\GitHub\\Bakanov\\MadSharpUtils\\MadUnsafe\\ILCall.dll");
+            //var typeCdecl = loadedAsssembly.MainModule.Types.First(x => x.Name.Equals("FuncCdecl")).Methods.First(x => x.Name.Equals("Generic") && x.Parameters.Count == 2);
+            //var typeStdcall = loadedAsssembly.MainModule.Types.First(x => x.Name.Equals("FuncStdCall")).Methods
+            //    .First(x => x.Name.Equals("Generic") && x.Parameters.Count == 2);
+            //var typeNative = loadedAsssembly.MainModule.Types.First(x => x.Name.Equals("FuncNative")).Methods
+            //    .First(x => x.Name.Equals("Generic") && x.Parameters.Count == 2);
+            //
+            //loadedAsssembly.Dispose();
+            Resolver = new DefaultAssemblyResolver();
+            //resolver.AddSearchDirectory(Environment.CurrentDirectory);
+            var runtimeDir = RuntimeEnvironment.GetRuntimeDirectory() + "/../";
+            Resolver.AddSearchDirectory(runtimeDir);
+            
+            Console.WriteLine($"RuntimeDir = {RuntimeEnvironment.GetRuntimeDirectory()}");
+            
             var an = new AssemblyNameDefinition("ILCall", new Version(1,0,0));
             dynamicAssembly = AssemblyDefinition.CreateAssembly(an, "ILCall.dll", new ModuleParameters()
             {
-                Kind = ModuleKind.Dll
+                Kind = ModuleKind.Dll,
+                Runtime = TargetRuntime.Net_2_0,
+                AssemblyResolver = Resolver
             });
 
             module = dynamicAssembly.MainModule;
-            var invalidOpEx = module.ImportReference(typeof(InvalidOperationException)).Resolve();
+            
+            //if(net35)
+            //module.RuntimeVersion = "v2.0.50727";
+            
+            var netstandard = LoadNetstandard10();
+            Console.WriteLine($"Core library: {netstandard.FullyQualifiedName} ({netstandard.RuntimeVersion})");
+            
+            //foreach (var netstandardType in netstandard.Types)
+            //{
+            //    Console.WriteLine($"StandardType: {netstandardType.Name}");
+            //}
+            
+            var invalidOpEx =
+                netstandard.Types.First(x => x.Name.Equals("InvalidOperationException", StringComparison.Ordinal));
             invalidOperationExceptionConstructor = invalidOpEx.GetConstructors()
                 .First(x =>
                     x.Parameters.Count == 1 && x.Parameters[0].ParameterType.TypeEquals(module.TypeSystem.String));
             invalidOperationExceptionConstructor = module.ImportReference(invalidOperationExceptionConstructor);
+
+            ValueTypeImported = module.ImportReference(netstandard.Types.First(x => x.Name.Equals("ValueType", StringComparison.Ordinal)));
+            VoidPtrImported = module.TypeSystem.Void.MakePointerType();
+            
+            Names.ImportedTypes = Names.TypeProtos.Select(typeProto =>
+            {
+                return module.ImportReference(netstandard.Types.First(x =>
+                    x.Name.Equals(typeProto.Name, StringComparison.Ordinal)));
+            }).ToArray();
             
             var managed = AddModType(new ModDefinition()
             {
                 hasThis = true,
                 callingConvention = MethodCallingConvention.Default,
                 name = "Managed"
-            });
-
-            var managedStatic = AddModType(new ModDefinition()
-            {
-                hasThis = false,
-                callingConvention = MethodCallingConvention.Default,
-                name = "Static"
             });
 
             var native = AddModType(new ModDefinition()
@@ -581,39 +601,25 @@ namespace ConsoleApplication2
             var il2cpp = AddModType(new ModDefinition()
             {
                 hasThis = true,
-                callingConvention = MethodCallingConvention.C,
+                callingConvention = MethodCallingConvention.Unmanaged, // platform cconv
                 isUnity = true,
                 il2cpp = true,
                 name = "IL2CPP"
             });
 
-            var il2cppStatic = AddModType(new ModDefinition()
-            {
-                hasThis = false,
-                callingConvention = MethodCallingConvention.C,
-                isUnity = true,
-                il2cpp = true,
-                name = "IL2CPPStatic"
-            });
-
-            var unityStatic = AddModType(new ModDefinition()
-            {
-                hasThis = false,
-                callingConvention = MethodCallingConvention.C,
-                isUnity = true,
-                name = "UnityStatic"
-            });
-
             var allTypes = new ModStruct[]
             {
-                managed, managedStatic, native, unity, unityStatic, cdecl, stdcall, thiscall, il2cpp, il2cppStatic
+                managed, native, unity, cdecl, stdcall, thiscall, il2cpp
             };
 
             GenerateToIL2CPP(unity, il2cpp);
-            GenerateToIL2CPP(unityStatic, il2cppStatic);
+            //GenerateToIL2CPP(unityStatic, il2cppStatic);
             GenerateToManaged(unity, il2cpp);
-            GenerateToManaged(unityStatic, il2cppStatic);
+            //GenerateToManaged(unityStatic, il2cppStatic);
 
+            ModStruct unityStatic = null;
+            ModStruct il2cppStatic = null;
+            
             foreach (var current in allTypes)
             {
                 foreach (var other in allTypes)
@@ -671,8 +677,8 @@ namespace ConsoleApplication2
             var asil2cpp = addToType.type.DefineMethod("AsIL2CPP", MethodAttributes.Public);
             asil2cpp.ReturnType = toType.type;
             var g = asil2cpp.Body.GetILProcessor();
-            var m1 = g.DeclareLocal(typeof(ulong));
-            var m2 = g.DeclareLocal(typeof(IntPtr));
+            var m1 = g.DeclareLocal(module.TypeSystem.UInt64);
+            var m2 = g.DeclareLocal(module.TypeSystem.IntPtr);
             var newStruct = g.DeclareLocal(toType.type);
             var label = g.DefineLabel();
 
@@ -716,8 +722,8 @@ namespace ConsoleApplication2
             asil2cpp.ReturnType = toType.type;
             var g = asil2cpp.Body.GetILProcessor();
             
-            var m1 = g.DeclareLocal(typeof(ulong));
-            var m2 = g.DeclareLocal(typeof(IntPtr));
+            var m1 = g.DeclareLocal(module.TypeSystem.UInt64);
+            var m2 = g.DeclareLocal(module.TypeSystem.IntPtr);
             var newStruct = g.DeclareLocal(toType.type);
             var label = g.DefineLabel();
 
